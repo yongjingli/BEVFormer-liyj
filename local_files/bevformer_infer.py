@@ -1,8 +1,3 @@
-# ---------------------------------------------
-# Copyright (c) OpenMMLab. All rights reserved.
-# ---------------------------------------------
-#  Modified by Zhiqi Li
-# ---------------------------------------------
 import argparse
 import mmcv
 import os
@@ -23,13 +18,21 @@ from projects.mmdet3d_plugin.bevformer.apis.test import custom_multi_gpu_test
 from mmdet.datasets import replace_ImageToTensor
 import time
 import os.path as osp
+from mmdet3d.apis import inference_multi_modality_detector, init_model
+from mmdet3d.models import (Base3DDetector, Base3DSegmentor,
+                            SingleStageMono3DDetector)
+
+from mmcv.image import tensor2imgs
+from types import MethodType
+from thop import profile
+from thop import clever_format
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description='MMDet test (and eval) a model')
-    parser.add_argument('config', help='test config file path')
-    parser.add_argument('checkpoint', help='checkpoint file')
+    parser.add_argument('--config', default=None, help='test config file path')
+    parser.add_argument('--checkpoint', default=None, help='checkpoint file')
     parser.add_argument('--out', help='output result file in pickle format')
     parser.add_argument(
         '--fuse-conv-bn',
@@ -107,20 +110,22 @@ def parse_args():
     return args
 
 
-def main():
+def init(config, checkpoint):
     args = parse_args()
+    args.config = config
+    args.checkpoint = checkpoint
 
-    assert args.out or args.eval or args.format_only or args.show \
-        or args.show_dir, \
-        ('Please specify at least one operation (save/eval/format/show the '
-         'results / save the results) with the argument "--out", "--eval"'
-         ', "--format-only", "--show" or "--show-dir"')
+    # assert args.out or args.eval or args.format_only or args.show \
+    #     or args.show_dir, \
+    #     ('Please specify at least one operation (save/eval/format/show the '
+    #      'results / save the results) with the argument "--out", "--eval"'
+    #      ', "--format-only", "--show" or "--show-dir"')
 
-    if args.eval and args.format_only:
-        raise ValueError('--eval and --format_only cannot be both specified')
-
-    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
-        raise ValueError('The output file must be a pkl file.')
+    # if args.eval and args.format_only:
+    #     raise ValueError('--eval and --format_only cannot be both specified')
+    #
+    # if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
+    #     raise ValueError('The output file must be a pkl file.')
 
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
@@ -192,7 +197,74 @@ def main():
     if args.seed is not None:
         set_random_seed(args.seed, deterministic=args.deterministic)
 
+    return cfg
+
+
+def model_infer(self, img_metas, img=None, prev_bev=None, rescale=False):
+    """Test function without augmentaiton."""
+    img_feats = self.extract_feat(img=img, img_metas=img_metas)
+    # return img_feats
+
+    bbox_list = [dict() for i in range(len(img_metas))]
+    new_prev_bev, bbox_pts = self.simple_test_pts(
+        img_feats, img_metas, prev_bev, rescale=rescale)
+    for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
+        result_dict['pts_bbox'] = pts_bbox
+    return new_prev_bev, bbox_list
+
+
+def cal_params_by_mmcv(model, img_metas, img):
+    from mmcv.cnn.utils.flops_counter import add_flops_counting_methods
+    flops_model = add_flops_counting_methods(model)
+    flops_model.eval()
+    flops_model.start_flops_count()
+
+    # input
+    # input_shape = (1, 100, 3)
+    # try:
+    #     batch = torch.ones(()).new_empty(
+    #         (1, *input_shape),
+    #         dtype=next(flops_model.parameters()).dtype,
+    #         device=next(flops_model.parameters()).device)
+    # except StopIteration:
+    #     # Avoid StopIteration for models which have no parameters,
+    #     # like `nn.Relu()`, `nn.AvgPool2d`, etc.
+    #     batch = torch.ones(()).new_empty((1, *input_shape))
+
+    _ = flops_model(img_metas, img)
+    flops_count, params_count = flops_model.compute_average_flops_cost()
+    flops_model.stop_flops_count()
+
+    flops, params = flops_count, params_count
+    # print(f'Flops: {flops}\nParams: {params}')
+    return flops, params
+
+
+def bevformer_infer():
+    # bevformer tiny
+    # cfg_path = "/home/dell/liyongjing/programs/BEVFormer-liyj/ckpts/bevformer_tiny.py"
+    # checkpoint_path = "/home/dell/liyongjing/programs/BEVFormer-liyj/ckpts/bevformer_tiny_epoch_24.pth"
+
+    # bevformer small
+    # cfg_path = "/home/dell/liyongjing/programs/BEVFormer-liyj/ckpts/bevformer_small.py"
+    # checkpoint_path = "/home/dell/liyongjing/programs/BEVFormer-liyj/ckpts/bevformer_small_epoch_24.pth"
+
+    # bevformer base
+    cfg_path = "/home/dell/liyongjing/programs/BEVFormer-liyj/ckpts/bevformer_base.py"
+    checkpoint_path = "/home/dell/liyongjing/programs/BEVFormer-liyj/ckpts/bevformer_r101_dcn_24ep.pth"
+
+
+    cfg = init(cfg_path, checkpoint_path)
+
+    # init model
+    device = 'cuda:0'
+    model = init_model(cfg_path, checkpoint_path, device=device)
+    # model = MMDataParallel(model, device_ids=[0])
+
+    # init dataloader
     # build the dataloader
+    samples_per_gpu = 1
+    distributed = False
     dataset = build_dataset(cfg.data.test)
     data_loader = build_dataloader(
         dataset,
@@ -203,64 +275,101 @@ def main():
         nonshuffler_sampler=cfg.data.nonshuffler_sampler,
     )
 
-    # build the model and load checkpoint
-    cfg.model.train_cfg = None
-    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
-    fp16_cfg = cfg.get('fp16', None)
-    if fp16_cfg is not None:
-        wrap_fp16_model(model)
-    checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
-    if args.fuse_conv_bn:
-        model = fuse_conv_bn(model)
-    # old versions did not save class info in checkpoints, this walkaround is
-    # for backward compatibility
-    if 'CLASSES' in checkpoint.get('meta', {}):
-        model.CLASSES = checkpoint['meta']['CLASSES']
-    else:
-        model.CLASSES = dataset.CLASSES
-    # palette for visualization in segmentation tasks
-    if 'PALETTE' in checkpoint.get('meta', {}):
-        model.PALETTE = checkpoint['meta']['PALETTE']
-    elif hasattr(dataset, 'PALETTE'):
-        # segmentation dataset has `PALETTE` attribute
-        model.PALETTE = dataset.PALETTE
+    # start det
+    show = False
+    out_dir = "/home/dell/下载/debug"
+    show_score_thr = 0.3
+    new_prev_bev = None
 
-    if not distributed:
-        # assert False TODO
-        model = MMDataParallel(model, device_ids=[0])
-        outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
-    else:
-        model = MMDistributedDataParallel(
-            model.cuda(),
-            device_ids=[torch.cuda.current_device()],
-            broadcast_buffers=False)
-        outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
-                                        args.gpu_collect)
+    model.eval()
+    results = []
+    dataset = data_loader.dataset
+    prog_bar = mmcv.ProgressBar(len(dataset))
 
-    rank, _ = get_dist_info()
-    if rank == 0:
-        if args.out:
-            print(f'\nwriting results to {args.out}')
-            assert False
-            #mmcv.dump(outputs['bbox_results'], args.out)
-        kwargs = {} if args.eval_options is None else args.eval_options
-        kwargs['jsonfile_prefix'] = osp.join('test', args.config.split(
-            '/')[-1].split('.')[-2], time.ctime().replace(' ', '_').replace(':', '_'))
-        if args.format_only:
-            dataset.format_results(outputs, **kwargs)
+    for i, data in enumerate(data_loader):
+        # model = MMDataParallel(model, device_ids=[0])   # 需要配合这个使用，在上方进行设置
+        # with torch.no_grad():
+        #     result = model(return_loss=False, rescale=True, **data)
 
-        if args.eval:
-            eval_kwargs = cfg.get('evaluation', {}).copy()
-            # hard-code way to remove EvalHook args
-            for key in [
-                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
-                    'rule'
-            ]:
-                eval_kwargs.pop(key, None)
-            eval_kwargs.update(dict(metric=args.eval, **kwargs))
+        with torch.no_grad():
+            img_metas = data["img_metas"][0].data[0]
+            img = data['img'][0].data[0]
 
-            print(dataset.evaluate(outputs, **eval_kwargs))
+            img = img.to(device)
+            # result = model.simple_test(img_metas, img)
+            # new_prev_bev, bbox_list = result
+
+            model.forward = MethodType(model_infer, model)
+            if 1:
+                result = model(img_metas, img, prev_bev=new_prev_bev)
+                new_prev_bev, bbox_list = result
+                # exit(1)
+            else:
+                # 不能先infer，因为会改变img_metas里的数值
+                # 计算参数量和计算量
+                # flops, params = profile(model, inputs=(img_metas, img))
+
+                # 采用mmcv的方式进行统计，要不然有些操作不计算，如Linear等
+                flops, params = cal_params_by_mmcv(model, img_metas, img)
+                flops, params = clever_format([flops, params], "%.3f")
+                print("img:", img.shape)
+                print("flops:", flops)
+                print("params:", params)
+                exit(1)
+
+        if show and 0:
+            # Visualize the results of MMDetection3D model
+            # 'show_results' is MMdetection3D visualization API
+            models_3d = (Base3DDetector, Base3DSegmentor,
+                         SingleStageMono3DDetector)
+            if isinstance(model.module, models_3d):
+                model.module.show_results(data, result, out_dir=out_dir)
+            # Visualize the results of MMDetection model
+            # 'show_result' is MMdetection visualization API
+            else:
+                batch_size = len(result)
+                if batch_size == 1 and isinstance(data['img'][0],
+                                                  torch.Tensor):
+                    img_tensor = data['img'][0]
+                else:
+                    img_tensor = data['img'][0].data[0]
+                img_metas = data['img_metas'][0].data[0]
+                imgs = tensor2imgs(img_tensor, **img_metas[0]['img_norm_cfg'])
+                assert len(imgs) == len(img_metas)
+
+                for i, (img, img_meta) in enumerate(zip(imgs, img_metas)):
+                    h, w, _ = img_meta['img_shape']
+                    img_show = img[:h, :w, :]
+
+                    ori_h, ori_w = img_meta['ori_shape'][:-1]
+                    img_show = mmcv.imresize(img_show, (ori_w, ori_h))
+
+                    if out_dir:
+                        out_file = osp.join(out_dir, img_meta['ori_filename'])
+                    else:
+                        out_file = None
+
+                    model.module.show_result(
+                        img_show,
+                        result[i],
+                        show=show,
+                        out_file=out_file,
+                        score_thr=show_score_thr)
+        results.extend(result)
+
+        batch_size = len(result)
+        for _ in range(batch_size):
+            prog_bar.update()
 
 
-if __name__ == '__main__':
-    main()
+
+    print("ffff")
+
+
+
+if __name__ == "__main__":
+    print("Start")
+    bevformer_infer()
+    print("End")
+
+

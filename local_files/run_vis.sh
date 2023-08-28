@@ -1,0 +1,1 @@
+python /home/dell/liyongjing/programs/BEVFormer-liyj/tools/analysis_tools/visual.py
