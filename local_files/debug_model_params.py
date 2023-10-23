@@ -472,7 +472,9 @@ def debug_model(cfg, in_tensort):
     # model = ModelFFN(cfg)
 
     # multi-head-attention
-    model = ModelMultiheadAttention(cfg)
+    # model = ModelMultiheadAttention(cfg)
+
+    print("model:", model)
 
     flops_model = add_flops_counting_methods(model)
     flops_model.eval()

@@ -312,6 +312,7 @@ def bevformer_infer():
                 # 采用mmcv的方式进行统计，要不然有些操作不计算，如Linear等
                 flops, params = cal_params_by_mmcv(model, img_metas, img)
                 flops, params = clever_format([flops, params], "%.3f")
+                print("model:", model)
                 print("img:", img.shape)
                 print("flops:", flops)
                 print("params:", params)
@@ -361,10 +362,7 @@ def bevformer_infer():
         for _ in range(batch_size):
             prog_bar.update()
 
-
-
     print("ffff")
-
 
 
 if __name__ == "__main__":
